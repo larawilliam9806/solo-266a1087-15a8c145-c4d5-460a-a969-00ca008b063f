@@ -12,7 +12,14 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import checking, coverage
-from .db import MissingRosterError, StorageError, Store, volume_view
+from .db import (
+    IssueNotFound,
+    MissingRosterError,
+    PlateNotInRoster,
+    StorageError,
+    Store,
+    volume_view,
+)
 
 
 DEFAULT_DB_PATH = os.environ.get("NEWSPAPER_DB", "data/checker.db")
@@ -184,15 +191,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/issues/{issue_id}/plates/{plate}", tags=["核查"])
     def plate_report(issue_id: str, plate: str, request: Request) -> dict[str, Any]:
+        """单版结论：只取该版在线索索引中的行，不读整期卷结果。"""
+
         store = current_store(request)
-        issue = store.get_issue(issue_id)
-        if issue is None:
+        try:
+            clues = store.get_plate_clues(issue_id, plate)
+        except IssueNotFound:
             raise HTTPException(status_code=404, detail="该期尚未登记")
-        report = checking.build_issue_report(issue, store.get_volumes(issue_id))
-        for item in report["plates"]:
-            if item["plate"] == plate:
-                return {"issue_id": issue_id, **item}
-        raise HTTPException(status_code=404, detail="该版号不在本期清单中")
+        except PlateNotInRoster:
+            raise HTTPException(status_code=404, detail="该版号不在本期清单中")
+        return {"issue_id": issue_id, **checking.build_single_plate_report(clues)}
 
     return app
 

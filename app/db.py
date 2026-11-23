@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -35,6 +36,29 @@ CREATE TABLE IF NOT EXISTS volumes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_volumes_issue ON volumes(issue_id);
+
+-- 单版核查线索索引：每个（期, 版, 卷）一行，查询只读目标版的行，
+-- 不再反序列化整期各卷的 result_json。
+CREATE TABLE IF NOT EXISTS plate_index (
+    issue_id     TEXT NOT NULL,
+    plate        TEXT NOT NULL,
+    volume_code  TEXT NOT NULL,
+    guaranteed   INTEGER NOT NULL,
+    scanned_json TEXT NOT NULL,
+    missed_json  TEXT NOT NULL,
+    PRIMARY KEY (issue_id, plate, volume_code)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_plate_index_lookup
+    ON plate_index (issue_id, plate);
+
+-- 某期存在 meta 行即表示该期已建索引；plates_json 是建索引时的版序快照，
+-- 与 issues.plates_json 不一致时按新清单重建。旧库首次单版查询时补建。
+CREATE TABLE IF NOT EXISTS index_meta (
+    issue_id    TEXT PRIMARY KEY,
+    plates_json TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -67,10 +91,49 @@ def _stored_frames(raw: str) -> list[coverage.Frame]:
     ]
 
 
+def _plate_index_rows(
+    issue_id: str,
+    volume_code: str,
+    result: dict[str, Any],
+) -> list[tuple[str, str, str, int, str, str]]:
+    """把一卷的排法结果拆成每个版一行的索引行（行序随版号清单）。"""
+
+    rows: list[tuple[str, str, str, int, str, str]] = []
+    for plate, page in result["pages"].items():
+        rows.append(
+            (
+                issue_id,
+                plate,
+                volume_code,
+                1 if page["guaranteed"] else 0,
+                _json(page["possible_scanned_frames"]),
+                _json(page["possible_missed_frames"]),
+            )
+        )
+    return rows
+
+
 class MissingRosterError(ValueError):
     def __init__(self) -> None:
         super().__init__("该期尚未登记版号清单，首次提交必须携带 plates")
         self.message = str(self)
+
+
+class IssueNotFound(LookupError):
+    """读取时期不存在。"""
+
+    def __init__(self, issue_id: str) -> None:
+        super().__init__(issue_id)
+        self.issue_id = issue_id
+
+
+class PlateNotInRoster(LookupError):
+    """版号不在该期版号清单中。"""
+
+    def __init__(self, issue_id: str, plate: str) -> None:
+        super().__init__(issue_id, plate)
+        self.issue_id = issue_id
+        self.plate = plate
 
 
 class Store:
@@ -169,12 +232,16 @@ class Store:
                     (issue_id, _json(roster), now, now),
                 )
                 recomputed: list[str] = []
+                # 新期没有卷，直接登记索引元数据；后续提交即增量维护。
+                self._upsert_index_meta(conn, issue_id, roster, now)
             elif roster_changed:
                 conn.execute(
                     "UPDATE issues SET plates_json = ?, updated_at = ? WHERE issue_id = ?",
                     (_json(roster), now, issue_id),
                 )
                 recomputed = self._recompute_volumes(conn, issue_id, roster, now)
+                # 版序变化，索引随各卷重判一并更新。
+                self._rebuild_issue_index(conn, issue_id, roster, now)
             else:
                 recomputed = []
 
@@ -269,6 +336,19 @@ class Store:
                     (_frames_to_json(frames), _json(result), now, issue_id, volume_code),
                 )
 
+            # 索引与业务数据在同一事务内维护：校验或写入失败整体回滚，
+            # 索引与卷结果永远对应同一份已提交数据。
+            if issue_created:
+                self._upsert_index_meta(conn, issue_id, roster, now)
+                self._replace_volume_index(conn, issue_id, volume_code, result)
+            elif roster_changed:
+                # 版序变化：各卷已按新清单重判，索引随之整期重建。
+                self._rebuild_issue_index(conn, issue_id, roster, now)
+            elif self._index_meta(conn, issue_id) is not None:
+                # 版序未变且索引已建：换交一卷只替换该卷在索引中的线索。
+                self._replace_volume_index(conn, issue_id, volume_code, result)
+            # 旧库该期尚未建索引：不做增量维护，首次单版查询时用已存结果补建。
+
             conn.execute("COMMIT")
         except (
             coverage.ArrangementError,
@@ -305,6 +385,93 @@ class Store:
                 }
             ),
         }
+
+    # -- 索引 ---------------------------------------------------------------
+
+    def _index_meta(
+        self, conn: sqlite3.Connection, issue_id: str
+    ) -> tuple[str, str] | None:
+        row = conn.execute(
+            "SELECT plates_json, updated_at FROM index_meta WHERE issue_id = ?",
+            (issue_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["plates_json"], row["updated_at"]
+
+    def _upsert_index_meta(
+        self,
+        conn: sqlite3.Connection,
+        issue_id: str,
+        roster: list[str],
+        now: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO index_meta (issue_id, plates_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(issue_id) DO UPDATE SET plates_json = excluded.plates_json, "
+            "updated_at = excluded.updated_at",
+            (issue_id, _json(roster), now),
+        )
+
+    def _replace_volume_index(
+        self,
+        conn: sqlite3.Connection,
+        issue_id: str,
+        volume_code: str,
+        result: dict[str, Any],
+    ) -> None:
+        """换交一卷：只替换该卷在索引中的线索，其它卷不动。"""
+
+        conn.execute(
+            "DELETE FROM plate_index WHERE issue_id = ? AND volume_code = ?",
+            (issue_id, volume_code),
+        )
+        conn.executemany(
+            "INSERT INTO plate_index "
+            "(issue_id, plate, volume_code, guaranteed, scanned_json, missed_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            _plate_index_rows(issue_id, volume_code, result),
+        )
+
+    def _rebuild_issue_index(
+        self,
+        conn: sqlite3.Connection,
+        issue_id: str,
+        roster: list[str],
+        now: str,
+    ) -> None:
+        """版序变化（或旧库补建）：按最新卷结果整期重建索引。"""
+
+        conn.execute("DELETE FROM plate_index WHERE issue_id = ?", (issue_id,))
+        rows = conn.execute(
+            "SELECT volume_code, result_json FROM volumes WHERE issue_id = ? "
+            "ORDER BY volume_code",
+            (issue_id,),
+        ).fetchall()
+        for row in rows:
+            result = json.loads(row["result_json"])
+            conn.executemany(
+                "INSERT INTO plate_index "
+                "(issue_id, plate, volume_code, guaranteed, scanned_json, missed_json) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                _plate_index_rows(issue_id, row["volume_code"], result),
+            )
+        self._upsert_index_meta(conn, issue_id, roster, now)
+
+    def _backfill_index(
+        self,
+        conn: sqlite3.Connection,
+        issue_id: str,
+        roster: list[str],
+        now: str,
+    ) -> None:
+        """旧库首次查询：用已存的卷结果补建该期索引。
+
+        在调用方开启的事务内完成；与换交提交冲突时由 SQLite 写锁裁决，
+        调用方回滚重试后即拿到换交后的新线索。
+        """
+
+        self._rebuild_issue_index(conn, issue_id, roster, now)
 
     # -- 读取 ---------------------------------------------------------------
 
@@ -389,6 +556,120 @@ class Store:
             }
         finally:
             conn.close()
+
+    # -- 单版核查（走索引）--------------------------------------------------
+
+    @staticmethod
+    def _is_busy(exc: sqlite3.Error) -> bool:
+        message = str(exc).lower()
+        return "locked" in message or "busy" in message
+
+    def _plate_clues_once(
+        self, conn: sqlite3.Connection, issue_id: str, plate: str
+    ) -> list[sqlite3.Row]:
+        """在给定连接的一个事务里完成“查 meta -> 必要时补建 -> 取该版线索”。"""
+
+        conn.execute("BEGIN")
+        issue_row = conn.execute(
+            "SELECT plates_json FROM issues WHERE issue_id = ?",
+            (issue_id,),
+        ).fetchone()
+        if issue_row is None:
+            raise IssueNotFound(issue_id)
+        roster: list[str] = json.loads(issue_row["plates_json"])
+        if plate not in roster:
+            raise PlateNotInRoster(issue_id, plate)
+
+        meta = self._index_meta(conn, issue_id)
+        if meta is None or meta[0] != issue_row["plates_json"]:
+            # 旧库未建索引，或版序已变而索引滞后：用已存结果补建/重建。
+            # 延迟事务在此升级为写事务；若与换交提交撞锁则抛出 BUSY，
+            # 由调用方回滚并以全新连接重试。
+            self._backfill_index(conn, issue_id, roster, utc_now())
+
+        return conn.execute(
+            "SELECT volume_code, guaranteed, scanned_json, missed_json "
+            "FROM plate_index WHERE issue_id = ? AND plate = ? "
+            "ORDER BY volume_code",
+            (issue_id, plate),
+        ).fetchall()
+
+    def get_plate_clues(self, issue_id: str, plate: str) -> dict[str, Any]:
+        """只取目标版在索引中的线索，不读整卷结果。
+
+        旧库该期首次查询时在事务内补建索引；读转写若与换交提交冲突
+        （SQLITE_BUSY），回滚整段、释放连接后退避重试。重试后要么复用
+        换交方已建好的新索引，要么基于换交后的卷结果补建，保证返回的是
+        仍有效的线索。
+        """
+
+        max_attempts = 5
+        rows: list[sqlite3.Row] = []
+
+        for attempt in range(max_attempts):
+            conn = self.connect()
+            closed = False
+            try:
+                rows = self._plate_clues_once(conn, issue_id, plate)
+                conn.execute("COMMIT")
+                break
+            except IssueNotFound:
+                _rollback(conn)
+                raise
+            except PlateNotInRoster:
+                _rollback(conn)
+                raise
+            except sqlite3.OperationalError as exc:
+                _rollback(conn)
+                if not self._is_busy(exc):
+                    raise StorageError(f"读取索引失败：{exc}") from exc
+                if attempt == max_attempts - 1:
+                    raise StorageError(
+                        f"数据库忙，暂时无法补建索引：{exc}"
+                    ) from exc
+                # 必须等写者（换交）提交后再试；先彻底关掉本连接释放读锁。
+                conn.close()
+                closed = True
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            except sqlite3.Error as exc:
+                _rollback(conn)
+                raise StorageError(f"读取索引失败：{exc}") from exc
+            finally:
+                if not closed:
+                    conn.close()
+
+        guaranteed_by: list[str] = []
+        scanned_options: list[dict[str, Any]] = []
+        missed_options: list[dict[str, Any]] = []
+        has_scanned = False
+
+        for row in rows:
+            code = row["volume_code"]
+            scanned = json.loads(row["scanned_json"])
+            if scanned:
+                has_scanned = True
+                if row["guaranteed"]:
+                    guaranteed_by.append(code)
+                for frame_no in scanned:
+                    scanned_options.append(
+                        {"volume_code": code, "frame_no": frame_no}
+                    )
+        if not has_scanned:
+            # 有已扫帧线索时跳过漏扫帧清单；缺扫版才解析漏扫线索。
+            for row in rows:
+                for frame_no in json.loads(row["missed_json"]):
+                    missed_options.append(
+                        {"volume_code": row["volume_code"], "frame_no": frame_no}
+                    )
+
+        return {
+            "issue_id": issue_id,
+            "plate": plate,
+            "guaranteed_by_volumes": guaranteed_by,
+            "scanned_options": scanned_options,
+            "missed_options": missed_options,
+        }
 
 
 def _volume_view(volume: dict[str, Any]) -> dict[str, Any]:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import itertools
+import json
 import random
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
@@ -435,3 +437,456 @@ def test_set_roster_endpoint_recomputes_and_rolls_back(client):
     assert bad.json()["error"]["data_unchanged"] is True
     assert client.get("/issues/I").json()["plates"] == ["1", "2", "3"]
     assert set(client.get("/issues/I/volumes/A").json()["pages"]) == {"1", "2", "3"}
+
+
+# ---------------------------------------------------------------------------
+# 单版线索索引
+# ---------------------------------------------------------------------------
+
+
+def _db_path(client) -> str:
+    return client.app.state.store.db_path
+
+
+def _index_rows(db_path, issue, plate):
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT volume_code, guaranteed, scanned_json, missed_json "
+            "FROM plate_index WHERE issue_id = ? AND plate = ? ORDER BY volume_code",
+            (issue, plate),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _index_meta(db_path, issue):
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT plates_json FROM index_meta WHERE issue_id = ?", (issue,)
+        ).fetchone()
+        return None if row is None else json.loads(row[0])
+    finally:
+        conn.close()
+
+
+def _seed_two_volumes(client, issue="I", plates=("1", "2", "3", "4", "5")):
+    # 卷 A：帧1=版1、帧3=版3 -> 版2 缺扫，漏扫帧 2 是唯一线索；版1/3 已扫。
+    submit(client, issue, "A", [
+        {"frame_no": 1, "candidates": ["1"]},
+        {"frame_no": 3, "candidates": ["3"]},
+    ], list(plates))
+    # 卷 B：帧5 认不出 -> 版2 在部分排法下可被已扫帧 5 拍到 -> 待核。
+    submit(client, issue, "B", [{"frame_no": 5, "candidates": []}])
+
+
+def test_plate_endpoint_matches_full_report_for_every_plate(client):
+    plates = ["1", "2", "3", "4", "5"]
+    _seed_two_volumes(client)
+
+    full = client.get("/issues/I/plates").json()
+    for item in full["plates"]:
+        single = client.get(f"/issues/I/plates/{item['plate']}")
+        assert single.status_code == 200, single.text
+        assert single.json() == {"issue_id": "I", **item}
+
+
+def test_index_is_built_on_write_and_only_reads_target_plate_rows(client):
+    _seed_two_volumes(client)
+    db_path = _db_path(client)
+
+    # 新库写入即建好索引，meta 版序快照与清单一致。
+    assert _index_meta(db_path, "I") == ["1", "2", "3", "4", "5"]
+    rows = _index_rows(db_path, "I", "2")
+    assert [r[0] for r in rows] == ["A", "B"]
+    # 卷 A 的版2 无已扫线索；卷 B 的版2 有已扫帧 5。
+    assert json.loads(rows[0][2]) == []
+    assert json.loads(rows[1][2]) == [5]
+
+    # 单版查询不反序列化任何卷的完整 result_json。
+    from app import db as db_module
+
+    parsed = []
+    real_loads = db_module.json.loads
+
+    def tracking_loads(value):
+        parsed.append(value)
+        return real_loads(value)
+
+    db_module.json.loads = tracking_loads
+    try:
+        r = client.get("/issues/I/plates/2")
+    finally:
+        db_module.json.loads = real_loads
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "pending"
+    conn = sqlite3.connect(db_path)
+    try:
+        result_payloads = [
+            row[0] for row in conn.execute("SELECT result_json FROM volumes").fetchall()
+        ]
+    finally:
+        conn.close()
+    assert not any(payload in parsed for payload in result_payloads)
+    # 有已扫线索时连漏扫帧清单都不解析：卷 A 的 missed_json 不出现在解析入参里。
+    missed_a = next(r[3] for r in rows if r[0] == "A")
+    assert missed_a not in parsed
+
+
+def test_scanned_hint_skipped_but_missing_plate_still_lists_missed_frames(client):
+    # 只提交卷 A：帧1=版1、帧3=版3，版2 缺扫但漏扫帧 2 可达，版5 够不着。
+    submit(client, "I", "A", [
+        {"frame_no": 1, "candidates": ["1"]},
+        {"frame_no": 3, "candidates": ["3"]},
+    ], ["1", "2", "3", "4", "5"])
+
+    # 版2 没有任何已扫线索：仍给出漏扫帧线索，且与整期报告完全一致。
+    missing = client.get("/issues/I/plates/2").json()
+    full = next(
+        p for p in client.get("/issues/I/plates").json()["plates"] if p["plate"] == "2"
+    )
+    assert missing == {"issue_id": "I", **full}
+    assert missing["status"] == "missing"
+    assert missing["possible_volumes_and_missed_frames"] == [
+        {"volume_code": "A", "frame_no": 2}
+    ]
+    assert missing["hint"] is None
+
+    # 版5 连漏扫帧也够不着 -> hint 提示另找胶片。
+    far = client.get("/issues/I/plates/5").json()
+    assert far["status"] == "missing"
+    assert far["possible_volumes_and_missed_frames"] == []
+    assert far["hint"]
+
+
+def test_resubmit_volume_replaces_only_its_index_rows(client):
+    _seed_two_volumes(client)
+    db_path = _db_path(client)
+
+    before_b = _index_rows(db_path, "I", "2")
+    # 换交卷 A：改成帧1=版1 一帧，版2 不再有卷 A 的漏扫线索。
+    submit(client, "I", "A", [{"frame_no": 1, "candidates": ["1"]}])
+
+    after_a = _index_rows(db_path, "I", "2")
+    b_rows = [r for r in after_a if r[0] == "B"]
+    assert len(b_rows) == 1
+    # 版序未变，卷 B 的索引行原封不动。
+    assert b_rows == [r for r in before_b if r[0] == "B"]
+    a_rows = [r for r in after_a if r[0] == "A"]
+    assert len(a_rows) == 1
+    assert json.loads(a_rows[0][3]) == []  # 卷 A 已无漏扫帧
+
+    # 单版结论与整期报告仍一致。
+    full = client.get("/issues/I/plates").json()
+    for item in full["plates"]:
+        assert client.get(f"/issues/I/plates/{item['plate']}").json() == {
+            "issue_id": "I",
+            **item,
+        }
+
+
+def test_removing_last_scanned_clue_reports_still_valid_missed_frames(client):
+    _seed_two_volumes(client)
+    # 初始：版2 靠卷 B 帧5 成为待核（有已扫线索）。
+    assert client.get("/issues/I/plates/2").json()["status"] == "pending"
+
+    # 换交卷 B，撤掉这条已扫线索：帧7 钉在版4，版2 再无已扫帧拍到。
+    submit(client, "I", "B", [{"frame_no": 7, "candidates": ["4"]}])
+
+    report = client.get("/issues/I/plates/2").json()
+    assert report["status"] == "missing"
+    full = next(
+        p for p in client.get("/issues/I/plates").json()["plates"] if p["plate"] == "2"
+    )
+    assert report == {"issue_id": "I", **full}
+    # 卷 A 的漏扫帧 2 仍是有效线索。
+    assert {"volume_code": "A", "frame_no": 2} in report[
+        "possible_volumes_and_missed_frames"
+    ]
+    assert report["hint"] is None
+
+
+def test_failed_resubmit_keeps_old_index_and_old_answer(client):
+    _seed_two_volumes(client)
+    before = client.get("/issues/I/plates/2").json()
+    db_path = _db_path(client)
+    conn = sqlite3.connect(db_path)
+    try:
+        before_rows = conn.execute(
+            "SELECT volume_code, scanned_json, missed_json FROM plate_index "
+            "WHERE issue_id = 'I' ORDER BY volume_code, plate"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # 候选版 9 不在清单 -> 422，整次提交（含索引）回滚。
+    bad = submit(client, "I", "B", [{"frame_no": 7, "candidates": ["9"]}])
+    assert bad.status_code == 422
+    assert bad.json()["error"]["data_unchanged"] is True
+
+    assert client.get("/issues/I/plates/2").json() == before
+    conn = sqlite3.connect(db_path)
+    try:
+        after_rows = conn.execute(
+            "SELECT volume_code, scanned_json, missed_json FROM plate_index "
+            "WHERE issue_id = 'I' ORDER BY volume_code, plate"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert after_rows == before_rows
+
+
+def test_roster_change_rebuilds_index_with_rejudged_volumes(client):
+    _seed_two_volumes(client, plates=("1", "2", "3"))
+    db_path = _db_path(client)
+
+    r = client.put("/issues/I/plates", json={"plates": ["1", "2", "3", "4"]})
+    assert r.status_code == 200, r.text
+    assert _index_meta(db_path, "I") == ["1", "2", "3", "4"]
+
+    conn = sqlite3.connect(db_path)
+    try:
+        indexed_plates = {
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT plate FROM plate_index WHERE issue_id = 'I'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert indexed_plates == {"1", "2", "3", "4"}
+
+    full = client.get("/issues/I/plates").json()
+    for item in full["plates"]:
+        assert client.get(f"/issues/I/plates/{item['plate']}").json() == {
+            "issue_id": "I",
+            **item,
+        }
+
+
+def test_legacy_db_backfills_index_on_first_plate_query_and_reuses(client):
+    _seed_two_volumes(client)
+    db_path = _db_path(client)
+
+    # 模拟旧库：删掉索引表数据与 meta，只留 issues/volumes 里的已存结果。
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM plate_index")
+        conn.execute("DELETE FROM index_meta")
+        conn.commit()
+    finally:
+        conn.close()
+    assert _index_meta(db_path, "I") is None
+
+    # 首次单版查询：用已存结果补建，结论与整期报告一致。
+    first = client.get("/issues/I/plates/2")
+    assert first.status_code == 200, first.text
+    full = next(
+        p for p in client.get("/issues/I/plates").json()["plates"] if p["plate"] == "2"
+    )
+    assert first.json() == {"issue_id": "I", **full}
+
+    assert _index_meta(db_path, "I") == ["1", "2", "3", "4", "5"]
+    rows_after_first = _index_rows(db_path, "I", "2")
+    assert rows_after_first
+
+    # 第二次查询直接复用，不再补建：把补建函数替换成会报错的哨兵。
+    from app import db as db_module
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("索引已存在，不应再次补建")
+
+    original = db_module.Store._backfill_index
+    db_module.Store._backfill_index = boom
+    try:
+        again = client.get("/issues/I/plates/2")
+    finally:
+        db_module.Store._backfill_index = original
+    assert again.json() == first.json()
+    assert _index_rows(db_path, "I", "2") == rows_after_first
+
+
+def test_backfill_retries_after_busy_and_succeeds(client, monkeypatch):
+    _seed_two_volumes(client)
+    db_path = _db_path(client)
+
+    # 旧库：无索引。
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM plate_index")
+        conn.execute("DELETE FROM index_meta")
+        conn.commit()
+    finally:
+        conn.close()
+
+    from app import db as db_module
+
+    real_backfill = db_module.Store._backfill_index
+    calls = {"n": 0}
+
+    def flaky_backfill(self, conn, issue_id, roster, now):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # 模拟补建与换交撞写锁：首次补建拿到 BUSY，触发回滚重试。
+            raise sqlite3.OperationalError("database is locked")
+        return real_backfill(self, conn, issue_id, roster, now)
+
+    monkeypatch.setattr(db_module.Store, "_backfill_index", flaky_backfill)
+
+    r = client.get("/issues/I/plates/2")
+    assert r.status_code == 200, r.text
+    assert calls["n"] == 2  # 首次撞锁回滚，重试成功
+    monkeypatch.undo()
+
+    # 重试后索引可用且与整期报告一致。
+    full = next(
+        p for p in client.get("/issues/I/plates").json()["plates"] if p["plate"] == "2"
+    )
+    assert r.json() == {"issue_id": "I", **full}
+
+
+def test_backfill_after_concurrent_resubmit_serves_new_clues(client):
+    """旧库补建窗口内换交已提交：补建后的查询必须反映换交后的新线索。"""
+
+    _seed_two_volumes(client)
+    db_path = _db_path(client)
+
+    # 旧库无索引。
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM plate_index")
+        conn.execute("DELETE FROM index_meta")
+        conn.commit()
+    finally:
+        conn.close()
+
+    from app import db as db_module
+
+    # 换交先完成（撤掉卷 B 对版2 的已扫线索），随后首次单版查询触发补建，
+    # 补建读取的是换交后的卷结果。
+    store = db_module.Store(db_path)
+    store.submit_volume("I", "B", None, [{"frame_no": 7, "candidates": ["4"]}])
+
+    report = client.get("/issues/I/plates/2").json()
+    full = next(
+        p for p in client.get("/issues/I/plates").json()["plates"] if p["plate"] == "2"
+    )
+    assert report == {"issue_id": "I", **full}
+    assert report["status"] == "missing"
+    assert {"volume_code": "A", "frame_no": 2} in report[
+        "possible_volumes_and_missed_frames"
+    ]
+
+
+def test_plate_index_endpoint_404s(client):
+    _seed_two_volumes(client)
+    assert client.get("/issues/NOPE/plates/1").status_code == 404
+    assert client.get("/issues/I/plates/9").status_code == 404
+    # 404 不应在旧库上留下半成品索引。
+    assert _index_meta(_db_path(client), "NOPE") is None
+
+
+def test_roster_first_then_volume_maintains_index(client):
+    # 先单独登记清单（此时无卷，只写 meta），再交卷应增量建本卷索引。
+    r = client.put("/issues/R/plates", json={"plates": ["1", "2", "3"]})
+    assert r.status_code == 200
+    assert _index_meta(_db_path(client), "R") == ["1", "2", "3"]
+    assert _index_rows(_db_path(client), "R", "1") == []
+
+    submit(client, "R", "A", [{"frame_no": 1, "candidates": ["1"]}])
+    rows = _index_rows(_db_path(client), "R", "1")
+    assert len(rows) == 1 and rows[0][0] == "A"
+    full = client.get("/issues/R/plates").json()
+    assert client.get("/issues/R/plates/1").json() == {
+        "issue_id": "R",
+        **next(p for p in full["plates"] if p["plate"] == "1"),
+    }
+
+
+def test_guaranteed_merge_across_volumes_via_index(client):
+    # 两卷都单独保证版1 已扫：guaranteed_by_volumes 合并两卷。
+    submit(client, "I", "A", [{"frame_no": 1, "candidates": ["1"]}], ["1", "2"])
+    submit(client, "I", "B", [{"frame_no": 2, "candidates": ["1"]}])
+    report = client.get("/issues/I/plates/1").json()
+    full = next(p for p in client.get("/issues/I/plates").json()["plates"]
+                if p["plate"] == "1")
+    assert report == {"issue_id": "I", **full}
+    assert report["status"] == "scanned"
+    assert report["guaranteed_by_volumes"] == ["A", "B"]
+    assert report["scanned_frames"] == [
+        {"volume_code": "A", "frame_no": 1},
+        {"volume_code": "B", "frame_no": 2},
+    ]
+
+
+def test_real_concurrent_backfill_and_resubmit(tmp_path):
+    """补建事务与换交事务真实撞锁：查询最终必须给出换交后的有效线索。"""
+
+    import threading
+
+    from app import db as db_module
+
+    db_path = str(tmp_path / "conc.db")
+    setup = db_module.Store(db_path)
+    setup.initialize()
+    setup.submit_volume(
+        "I",
+        "A",
+        ["1", "2", "3", "4", "5"],
+        [
+            {"frame_no": 1, "candidates": ["1"]},
+            {"frame_no": 3, "candidates": ["3"]},
+        ],
+    )
+    setup.submit_volume("I", "B", None, [{"frame_no": 5, "candidates": []}])
+
+    # 退化为旧库：索引为空。
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM plate_index")
+        conn.execute("DELETE FROM index_meta")
+        conn.commit()
+    finally:
+        conn.close()
+
+    errors: list[Exception] = []
+
+    def resubmit() -> None:
+        try:
+            db_module.Store(db_path).submit_volume(
+                "I", "B", None, [{"frame_no": 7, "candidates": ["4"]}]
+            )
+        except Exception as exc:  # pragma: no cover - 仅用于暴露并发问题
+            errors.append(exc)
+
+    def query() -> None:
+        try:
+            db_module.Store(db_path).get_plate_clues("I", "2")
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    t1 = threading.Thread(target=resubmit)
+    t2 = threading.Thread(target=query)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert not errors
+
+    # 换交已生效，索引随之可用；版2 缺扫，卷 A 漏扫帧 2 仍是有效线索。
+    report = client_get_single(db_path, "I", "2")
+    assert report["status"] == "missing"
+    assert {"volume_code": "A", "frame_no": 2} in report[
+        "possible_volumes_and_missed_frames"
+    ]
+    assert _index_meta(db_path, "I") == ["1", "2", "3", "4", "5"]
+
+
+def client_get_single(db_path, issue, plate):
+    from app import checking
+    from app import db as db_module
+
+    clues = db_module.Store(db_path).get_plate_clues(issue, plate)
+    return {"issue_id": issue, **checking.build_single_plate_report(clues)}
